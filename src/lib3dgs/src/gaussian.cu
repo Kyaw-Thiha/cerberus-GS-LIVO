@@ -1099,7 +1099,7 @@ void GaussianModel::Save_ply_our(const std::filesystem::path& file_path,std::vec
 
 
 std::cout<<"inited GS to attributes"<<std::endl;
-    Write_output_ply("/home/sheng/01sheng/gaussian-splatting/output/55023a9e-1/point_cloud/iteration_30000/point_cloud.ply", tensor_attributes, attributes);
+    Write_output_ply(file_path, tensor_attributes, attributes);
         // Write_output_ply(folder / "point_cloud.ply", tensor_attributes, attributes);
 
 std::cout<<" GS saved"<<std::endl;
@@ -1184,8 +1184,7 @@ std::vector<torch::Tensor> tensor_attributes = {xyz.clone(),
     std::cout<<"inited GS to attributes"<<std::endl;
     // auto folder = file_path / ("point_cloud/iteration_999999");
     // Write_output_ply(folder / "point_cloud.ply", tensor_attributes, attributes);
-    // "/home/sheng/01sheng/gaussian-splatting/output/55023a9e-1/point_cloud/iteration_30000/point_cloud.ply"
-    auto folder = "/home/sheng/01sheng/gaussian-splatting/output/55023a9e-1/point_cloud/iteration_30000/"/file_path;
+    auto folder = file_path;
     Write_output_ply(folder, tensor_attributes, attributes);
     std::cout<<" GS saved"<<std::endl;
 
