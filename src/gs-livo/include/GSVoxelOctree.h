@@ -8,7 +8,6 @@
 #include <mutex>
 #include <omp.h>
 #include <pcl/common/io.h>
-#include <ros/ros.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
