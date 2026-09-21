@@ -493,14 +493,24 @@ void VIOManager::retrieveFrom_GS_Map2(vector<pointWithVar> &pg)
     if(gsmap_manager->gs_map_.empty()) return;
 
     if(sub_GSMap.size() > outlier_threshold3) {
-     
+
     size_t keep_size =rand() % (int)(sub_GSMap.size() * 0.5);
     delete_size=sub_GSMap.size()-keep_size;
       // int pop_size = rand() % (int)(sub_GSMap.size() * 0.7);
+
+      // The front `delete_size` entries are about to be dropped from the
+      // actively-tracked scratch buffer to bound its size. Persist their
+      // current (possibly photometrically-refined, via Dump_to_our_format)
+      // state into the persistent octree first instead of discarding it.
+      for (auto it = sub_GSMap.begin(); it != sub_GSMap.end() - keep_size; ++it)
+      {
+        gsmap_manager->UpdateGSMap(new GS_point(*it));
+      }
+
       vector<GS_point> temp_gs;
       vector<GSVoxelOctree*> temp_octree;
-      
-      temp_gs.insert(temp_gs.end(), 
+
+      temp_gs.insert(temp_gs.end(),
           sub_GSMap.end() - keep_size, sub_GSMap.end());
       temp_octree.insert(temp_octree.end(),
           sub_octree_ptr_list.end() - keep_size, sub_octree_ptr_list.end());
@@ -569,8 +579,20 @@ void VIOManager::retrieveFrom_GS_Map2(vector<pointWithVar> &pg)
                     
                     pt->index = sub_GSMap.size();
                     sub_GSMap.push_back(*pt);
-                    sub_octree_ptr_list.push_back(leaf_node_list[i]);
-                    
+                    // NOTE: leaf_node_list[i] (and the whole octree rooted
+                    // at corre_gs_voxel->second) is deleted a few lines
+                    // below, right after this loop, once its points have
+                    // been copied by value into sub_GSMap. Storing that
+                    // about-to-be-freed pointer here would leave
+                    // sub_octree_ptr_list holding a dangling pointer for
+                    // the lifetime of this entry. The point's data is
+                    // already fully captured by value in sub_GSMap, and
+                    // sub_octree_ptr_list is only ever used as an index-
+                    // parallel bookkeeping array (its pointees are never
+                    // dereferenced for entries added on this path), so
+                    // store nullptr instead of a dangling pointer.
+                    sub_octree_ptr_list.push_back(nullptr);
+
                     assert(sub_GSMap.size() == sub_octree_ptr_list.size());
                 }
             }
@@ -641,15 +663,22 @@ void VIOManager::retrieveFrom_GS_Map2(vector<pointWithVar> &pg)
                     if(pt->index >= 0 && pt->index < sub_GSMap.size()) 
                     {
                         int lastIdx = sub_GSMap.size() - 1;
-                        if (pt->index != lastIdx) 
+                        if (pt->index != lastIdx)
                         {
-                            GSVoxelOctree* current_octree = sub_octree_ptr_list[pt->index];
-                            GSVoxelOctree* last_octree = sub_octree_ptr_list[lastIdx];
-                            
-
                             std::swap(sub_GSMap[pt->index], sub_GSMap[lastIdx]);
                             std::swap(sub_octree_ptr_list[pt->index], sub_octree_ptr_list[lastIdx]);
-                            
+
+                            // Only re-point the *indices* here; the actual
+                            // removal (persist + pop_back) happens once,
+                            // below, after the swap -- not once per point
+                            // in this inner loop. Previously pt->index=-1
+                            // and the pop_back() calls lived inside this
+                            // loop body, so a leaf with more than one
+                            // gs_points_ entry would pop_back() sub_GSMap
+                            // multiple times for a single eviction (and,
+                            // once the per-leaf point cap was raised above
+                            // one, could pop far more elements than
+                            // intended, including unrelated ones).
                             for(auto &leaf : corre_gs_voxel->second->leaf_node_list) {
                                 for(auto &point : leaf->gs_points_) {
                                     if(point->index == lastIdx) {
@@ -658,13 +687,21 @@ void VIOManager::retrieveFrom_GS_Map2(vector<pointWithVar> &pg)
                                     else if(point->index == pt->index) {
                                         point->index = lastIdx;
                                     }
-                                  pt->index = -1;
-                                  sub_GSMap.pop_back();
-                                  sub_octree_ptr_list.pop_back();
                                 }
                             }
                         }
-                        
+
+                        // Persist the evicted point's current (possibly
+                        // photometrically-refined, via Dump_to_our_format
+                        // at the end of the previous frame) state into the
+                        // persistent octree before dropping it from the
+                        // actively-tracked scratch buffer, instead of
+                        // discarding its refinement outright.
+                        gsmap_manager->UpdateGSMap(new GS_point(sub_GSMap.back()));
+
+                        pt->index = -1;
+                        sub_GSMap.pop_back();
+                        sub_octree_ptr_list.pop_back();
 
                         assert(sub_GSMap.size() == sub_octree_ptr_list.size());
                     }
@@ -2469,6 +2506,21 @@ void VIOManager::processFrameGS(cv::Mat &img, vector<pointWithVar> &pg, const un
         cv::waitKey(1); 
       }
     }
+
+    // Write the photometrically-optimized Gaussian parameters (position,
+    // scale/distance, rotation, color, opacity) back out of the torch
+    // tensors and into sub_GSMap. Previously this call was missing: the
+    // optimizer refined `gaussians`' tensors every frame, but nothing ever
+    // read the refined values back out, so the refinement was discarded at
+    // the end of every frame and sub_GSMap (and, downstream of it, the
+    // persistent GSVoxelOctree map) only ever saw the pre-optimization
+    // values inserted by insertPointInto_GS_Map2() below. Doing this here
+    // means the next frame's Create_from_our_format(sub_GSMap) continues
+    // optimizing from the refined state instead of restarting from the raw
+    // geometric measurement, and it lets retrieveFrom_GS_Map2() persist the
+    // refined values into the octree when a point is evicted from active
+    // tracking or dropped by the outlier-capacity downsample.
+    gaussians.Dump_to_our_format(sub_GSMap, static_cast<int>(sub_GSMap.size()));
   }
 
 

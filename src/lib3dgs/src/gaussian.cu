@@ -344,15 +344,26 @@ void GaussianModel::Create_from_our_format(std::vector<GS_point>& GaussianCloud)
 
 void GaussianModel::Dump_to_our_format(std::vector<GS_point>& GaussianCloud,int size) {
 
-
+    // Pack the optimized per-Gaussian tensors back into GS_point's memory
+    // layout: Point(3) + Normal(3) + Distance(3) + Quaternions(4) +
+    // Color(3) + opacity(1) + index(1) + flag_in_fov(1) = 19 floats. This
+    // must mirror Create_from_our_format's narrow() offsets exactly, or the
+    // reconstructed GS_points silently end up with fields written into the
+    // wrong slots (this previously duplicated _distance into the Normal
+    // slot and swapped index/flag_in_fov, corrupting the index bookkeeping
+    // that retrieveFrom_GS_Map2 relies on for its swap-erase logic).
 
     auto _distance = torch::exp(_scaling).to(torch::kCPU);
 
-
+    // Normal is not part of the optimized Gaussian state (no corresponding
+    // tensor is tracked), and is not read back from the map once a point
+    // has been inserted, so it is safe to zero it out here rather than
+    // mis-packing another field's data into this slot.
+    auto _normal_placeholder = torch::zeros_like(_distance);
 
     auto _fused_color = SH2RGB(_features_dc.to(torch::kCPU).squeeze(1)) * 255;
-    auto _xyz2=_xyz.to(torch::kCPU); 
-    auto _rotation2=_rotation.to(torch::kCPU); 
+    auto _xyz2=_xyz.to(torch::kCPU);
+    auto _rotation2=_rotation.to(torch::kCPU);
     auto _opacity2=_opacity.to(torch::kCPU);
 //   const char* red_background = "\033[41m";
 //   // ANSI escape code for green text
@@ -370,7 +381,7 @@ void GaussianModel::Dump_to_our_format(std::vector<GS_point>& GaussianCloud,int 
 //     std::cout << "_rotation shape: " << _rotation.sizes() << std::endl;
     // auto zeros_column = torch::zeros({_xyz2.size(0), 1}, torch::kInt32).to(torch::kCPU);
 
-    torch::Tensor gaussians = torch::cat({_xyz2, _distance, _distance, _rotation2, _fused_color,_opacity2,_flag_in_fov,_index}, 1);
+    torch::Tensor gaussians = torch::cat({_xyz2, _normal_placeholder, _distance, _rotation2, _fused_color, _opacity2, _index, _flag_in_fov}, 1);
 
 
     // std::vector<GS_point> gs_points(GaussianCloud.size());
