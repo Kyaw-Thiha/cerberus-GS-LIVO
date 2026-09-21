@@ -24,6 +24,17 @@
 #define GSMAP_HASH_P 116101
 #define GSMAP_MAX_N 10000000000
 
+// Maximum number of GS_points retained per leaf voxel (~0.5m cell at the
+// default max_layer_=3 / voxel_size_=3 configuration). Previously this was
+// hard-capped at a single point per leaf via a gate on the root octree's
+// aggregate leaf_node_list size, which (a) actually blocked every leaf but
+// the first one ever populated in a given root/coarse voxel, silently
+// leaking every other point inserted into that coarse voxel for the
+// lifetime of the map, and (b) even at a correct one-per-leaf cap would
+// have been too tight once photometrically-refined points are written back
+// into the octree (see VIOManager::retrieveFrom_GS_Map2 / processFrameGS).
+#define GSMAP_MAX_POINTS_PER_LEAF 4
+
 
 
 // Forward declaration
@@ -113,23 +124,32 @@ public:
     }
     else
     {
-      // 已经切割到了 叶子节点
-      if(gs_points_.size() < 1)
+      // Reached a leaf node (layer_ == max_layer_). Keep a small bounded
+      // list of points per leaf instead of a single point: this both fixes
+      // a prior bug where the check was against the ROOT octree's
+      // aggregate leaf_node_list size (root_voxel_->leaf_node_list.size()<1)
+      // rather than this leaf's own point count, which meant only the very
+      // first leaf ever populated within an entire coarse (root) voxel
+      // could accept a point -- every other leaf in that same coarse voxel
+      // silently dropped (and leaked) every point inserted into it for the
+      // lifetime of the map. It also gives photometrically-refined points
+      // written back after optimization somewhere to land instead of being
+      // dropped outright by a strict one-point cap.
+      if (gs_points_.size() < GSMAP_MAX_POINTS_PER_LEAF)
       {
-
-
-        if(root_voxel_->leaf_node_list.size()<1)
-        {
-
         pv->index = -1;
-
         gs_points_.push_back(pv);
-        root_voxel_->leaf_node_list.push_back(this);
-
+        // Register this leaf with the root octree's leaf list the first
+        // time it gains a point (registration is per-leaf, not per-root).
+        if (gs_points_.size() == 1)
+        {
+          root_voxel_->leaf_node_list.push_back(this);
         }
-
-
-
+      }
+      else
+      {
+        // Leaf is at capacity: drop the incoming point, but do not leak it.
+        delete pv;
       }
     }
   }
