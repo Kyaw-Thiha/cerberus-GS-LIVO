@@ -165,20 +165,27 @@ include_directories(
   include
 )
 
+# Path to the built lib3dgs shared library. Defaults to the sibling
+# lib3dgs/build directory in this repo, but can be overridden at configure
+# time, e.g.:
+#   cmake -DLIB3DGS_LIB_PATH=/path/to/lib3dgs_lib.so ..
+set(LIB3DGS_LIB_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../lib3dgs/build/lib3dgs_lib.so"
+  CACHE FILEPATH "Path to the built lib3dgs_lib shared library")
+
 # Add libraries
 add_library(vio src/vio.cpp src/frame.cpp src/visual_point.cpp)
 
 target_link_libraries(vio
-  /home/sheng/02GS_LIVO/lib3dgs/build/lib3dgs_lib.so
+  ${LIB3DGS_LIB_PATH}
   # ${TORCH_LIBRARIES}
   # tinyply
   # simple-knn
 )
 
-target_include_directories(vio PUBLIC   
-${CMAKE_SOURCE_DIR}/3dgs/includes 
-${CMAKE_SOURCE_DIR}/3dgs/cuda_rasterizer 
-${CMAKE_SOURCE_DIR}/3dgs/external/tinyply/source
+target_include_directories(vio PUBLIC
+${CMAKE_CURRENT_SOURCE_DIR}/../lib3dgs/includes
+${CMAKE_CURRENT_SOURCE_DIR}/../lib3dgs/cuda_rasterizer
+${CMAKE_CURRENT_SOURCE_DIR}/../lib3dgs/external/tinyply/source
 ${LIBTORCH_INCLUDE_DIR}
 )
 
