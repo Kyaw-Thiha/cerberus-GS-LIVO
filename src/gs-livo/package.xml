@@ -32,10 +32,32 @@
   <depend>image_transport</depend>
   <depend>livox_ros_driver2</depend>
 
+  <!-- Vendored sub-tree: rpg_vikit (Robotic-Developer-Road fork, patched
+       to ament_cmake -- see src/rpg_vikit/{vikit_common,vikit_ros}/package.xml
+       for the patches themselves). Brought in via add_subdirectory(rpg_vikit)
+       at gs-livo/CMakeLists.txt:103, not via colcon's normal src/ walker. -->
+  <depend>vikit_common</depend>
+  <depend>vikit_ros</depend>
+
+  <!-- fmt: required by vikit_common/CMakeLists.txt (find_package(fmt REQUIRED)
+       at its :34). Not previously declared here because the build was never
+       attempted with rpg_vikit actually present; declare now to make it
+       explicit. -->
+  <depend>libfmt-dev</depend>
+
+  <!-- EIGEN3_INCLUDE_DIR / PCL_INCLUDE_DIRS in CMakeLists.txt are legacy
+       variable-based usage -- declare the apt-side package so the find works
+       under a clean install. -->
+  <depend>eigen</depend>
+
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 
-  <export>
-    <build_type>ament_cmake</build_type>
-  </export>
+  <!-- The <export><build_type>ament_cmake</build_type></export> block was
+       removed because ament_cmake forbids more than one ament_package() call
+       per CMake configure run -- and the vendored rpg_vikit/{vikit_common,
+       vikit_ros} subtrees each call ament_package() themselves. Dropping
+       this export tag is the documented ament idiom for "this CMakeLists.txt
+       is plain CMake with ament targets, but is not itself an ament package";
+       see the rpg_vikit vendoring comment block in CMakeLists.txt. -->
 </package>

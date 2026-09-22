@@ -12,6 +12,11 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 
+#include "gs_map_writer.h"
+
+#include <algorithm>
+#include <filesystem>
+
 LIVMapper::LIVMapper(const rclcpp::NodeOptions &options)
     : rclcpp::Node("laser_mapping_node", options),
       extT(0, 0, 0),
@@ -41,13 +46,29 @@ LIVMapper::LIVMapper(const rclcpp::NodeOptions &options)
   vio_manager.reset(new VIOManager());
   root_dir = ROOT_DIR;
   initializeFiles();
-  initializeComponents();
+  // initializeComponents() is intentionally NOT called from the constructor.
+  // It runs vio_manager->initializeVIO() (LIVMapper.cpp:260) which dereferences
+  // vio_manager->cam at vio.cpp:52-61 -- and cam is set by initializeCamera()
+  // using loadFromRosNs(shared_from_this(), ...), which throws std::bad_weak_ptr
+  // when called from inside a constructor body (the shared_ptr from
+  // std::make_shared<LIVMapper> hasn't finished construction yet, so
+  // enable_shared_from_this::weak_this is still empty). main.cpp calls
+  // initializeCamera() THEN initializeComponents() after make_shared returns.
+  // See the corresponding note in include/LIVMapper.h and src/main.cpp.
   tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(this);
   path.header.stamp = this->now();
   path.header.frame_id = "camera_init";
 }
 
-LIVMapper::~LIVMapper() {}
+LIVMapper::~LIVMapper()
+{
+  // Backstop for abnormal exits where run()'s tail did not run (e.g. an
+  // uncaught exception in the per-frame loop). The run() tail already
+  // waits on gs_save_future_ before returning, so this is only here to
+  // prevent the future's destructor from blocking forever if the
+  // future is still valid but the worker thread is still running.
+  if (gs_save_future_.valid()) gs_save_future_.wait();
+}
 
 void LIVMapper::readParameters()
 {
@@ -168,6 +189,28 @@ void LIVMapper::readParameters()
   this->declare_parameter<bool>("publish.dense_map_en", false);
   this->get_parameter("publish.dense_map_en", dense_map_en);
 
+  // 3D Gaussian Splat map persistence (gated async export -- see
+  // LIVMapper::saveGSMap() for the actual save path and
+  // VIOManager::snapshot_gs_map_under_lock for the lock-protected snapshot).
+  // All four flags default to safe / no-write values. Setting gs_save_en
+  // to true is what flips the master switch; the other three tune cadence,
+  // shutdown behavior, and disk-usage retention. See plans/slam_handoff.md
+  // §1 (GS-LIVO row) for the contract and design rationale.
+  this->declare_parameter<bool>("publish.gs_save_en", false);
+  this->get_parameter("publish.gs_save_en", gs_save_en);
+  this->declare_parameter<bool>("publish.save_on_shutdown", true);
+  this->get_parameter("publish.save_on_shutdown", save_on_shutdown_);
+  this->declare_parameter<int>("publish.save_interval_frames", 500);
+  this->get_parameter("publish.save_interval_frames", save_interval_frames_);
+  this->declare_parameter<int>("publish.max_retained_saves", 5);
+  this->get_parameter("publish.max_retained_saves", max_retained_saves_);
+  // Compute the absolute save directory from root_dir (set in the
+  // constructor before this method is called -- root_dir is initialized
+  // at LIVMapper.cpp:50 from ROOT_DIR). All writes land here, so the
+  // detached worker thread only needs the path -- no shared state with
+  // the hot loop after the snapshot is taken.
+  gs_save_dir_ = std::filesystem::path(root_dir) / "Log" / "GSMap";
+
 
   // 3dgs parameters
 // sheng launch 读取参数
@@ -212,11 +255,11 @@ void LIVMapper::initializeComponents()
   voxelmap_manager->extT_ << VEC_FROM_ARRAY(extrinT);
   voxelmap_manager->extR_ << MAT_FROM_ARRAY(extrinR);
 
-  // TODO(ros2-migration): rpg_vikit is not vendored in this repo (pre-existing gap); vk::camera_loader::loadFromRosNs
-  // used ROS1 param-server namespace lookup — needs a ROS2-compatible replacement (e.g.
-  // loadFromRos(shared_from_this(), "laserMapping", ...) once rpg_vikit ports its own ROS1->ROS2, or a manual
-  // declare_parameter-based camera intrinsics loader) once rpg_vikit is vendored/ported.
-  // if (!vk::camera_loader::loadFromRosNs("laserMapping", vio_manager->cam)) throw std::runtime_error("Camera model not correctly specified.");
+  // Camera intrinsics load moved to initializeCamera() -- it must run AFTER
+  // make_shared<LIVMapper> (so shared_from_this() works) and BEFORE this
+  // initializeComponents() (because vio_manager->initializeVIO at :260
+  // dereferences vio_manager->cam at vio.cpp:52-61). main.cpp enforces the
+  // ordering: initializeCamera() THEN initializeComponents().
 
   vio_manager->grid_size = grid_size;
   vio_manager->patch_size = patch_size;
@@ -275,7 +318,36 @@ void LIVMapper::initializeComponents()
   slam_mode_ = (img_en && lidar_en) ? LIVO : imu_en ? ONLY_LIO : ONLY_LO;
 }
 
-void LIVMapper::initializeFiles() 
+void LIVMapper::initializeCamera()
+{
+  // Loads camera intrinsics via the rpg_vikit vendored helper. Uses the
+  // ROS2 overload of vk::camera_loader::loadFromRosNs, which takes an
+  // rclcpp::Node::SharedPtr and looks up the camera params under the
+  // given namespace on that node. The fork's config/avia_ros2.yaml:115-127
+  // declares the params at the top level of laser_mapping_node's
+  // ros__parameters (cam_model, cam_width, cam_height, scale, cam_fx,
+  // cam_fy, cam_cx, cam_cy, cam_d0..cam_d3), which matches what the
+  // Pinhole branch of camera_loader.cpp:43-56 expects to find.
+  //
+  // MUST be called from main.cpp AFTER std::make_shared<LIVMapper>()
+  // returns. shared_from_this() inside a constructor body throws
+  // std::bad_weak_ptr (enable_shared_from_this::weak_this is not yet
+  // initialized); this is the entire reason initializeCamera() is a
+  // separate method instead of being folded into initializeComponents().
+  // MUST also run BEFORE initializeComponents() -- that method calls
+  // vio_manager->initializeVIO() at line 260, which dereferences
+  // vio_manager->cam at vio.cpp:52-61.
+  //
+  // On failure, throw the same exception the original ROS1 code threw
+  // (the camera model is a hard dependency of the photometric core --
+  // running VIO with nullptr cam segfaults on the first image callback).
+  if (!vk::camera_loader::loadFromRosNs(shared_from_this(), "laser_mapping_node", vio_manager->cam))
+  {
+    throw std::runtime_error("Camera model not correctly specified.");
+  }
+}
+
+void LIVMapper::initializeFiles()
 {
   if (pcd_save_en && colmap_output_en)
   {
@@ -674,8 +746,125 @@ void LIVMapper::run()
     // if (!p_imu->imu_time_init) continue;
 
     stateEstimationAndMapping();
+
+    // Per-frame GS map save trigger (gated by gs_save_en + save_interval_frames).
+    // The actual snapshot + I/O happen on a detached std::future -- this
+    // branch only checks the cadence condition and spawns the worker if it
+    // is time. Cheaper than the I/O itself by ~3 orders of magnitude
+    // (counter check vs. a memcpy of a multi-MB GS map).
+    if (gs_save_en && save_interval_frames_ > 0 &&
+        (gs_frame_counter_ - last_saved_frame_) >= save_interval_frames_ &&
+        !gs_save_in_progress_.load())
+    {
+      ++gs_frame_counter_;  // bumped only on frames that actually advanced
+                            // the map, so a save_interval_frames of 500
+                            // means ~500 processed frames between saves even
+                            // if sync_packages returned false on others
+      const int frame_idx = gs_frame_counter_;
+      last_saved_frame_ = frame_idx;
+      gs_save_in_progress_.store(true);
+      // std::move the snapshot out of the future capture list so the
+      // hot loop releases the mutex immediately on return. The future's
+      // worker thread then writes the PLY without holding any shared
+      // state. The atomic is cleared at the end of the worker (with a
+      // small lambda capture) so a later trigger can fire.
+      gs_save_future_ = std::async(std::launch::async,
+        [this, frame_idx]() {
+          try {
+            auto snapshot = vio_manager->snapshot_gs_map_under_lock();
+            auto path = gs_save_dir_ / ("gs_map_" + std::to_string(frame_idx) + ".ply");
+            gs_map_io::dump_gs_map_to_ply(path, snapshot);
+            prune_old_gs_saves_(frame_idx);
+          } catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "GS map save failed: %s", e.what());
+          }
+          gs_save_in_progress_.store(false);
+        });
+    }
+    else
+    {
+      ++gs_frame_counter_;
+    }
   }
+  // Shutdown path: savePCD() is the existing mirror -- saveGSMap() sits
+  // right next to it and writes gs_map_final.ply (never pruned by
+  // max_retained_saves_). saveGSMap() handles its own gating (no-op when
+  // gs_save_en is false OR save_on_shutdown_ is false).
   savePCD();
+  saveGSMap();
+  // Wait for any in-flight async save to finish before letting LIVMapper
+  // destruct -- otherwise gs_map_manager / sub_GSMap could be torn down
+  // while the worker thread is still reading from them. The future is
+  // joined in the destructor too as a backstop for abnormal exits.
+  if (gs_save_future_.valid()) gs_save_future_.wait();
+}
+
+void LIVMapper::saveGSMap()
+{
+  if (!gs_save_en || !save_on_shutdown_) return;
+  // Same pattern as the periodic trigger, but unconditionally writes
+  // gs_map_final.ply (which max_retained_saves_ does not prune -- the
+  // shutdown save is the "what we have right now" record).
+  if (gs_save_in_progress_.load())
+  {
+    // Periodic save still running. Wait for it before starting the
+    // shutdown save so they don't trample each other on the disk.
+    if (gs_save_future_.valid()) gs_save_future_.wait();
+  }
+  auto snapshot = vio_manager->snapshot_gs_map_under_lock();
+  try {
+    auto path = gs_save_dir_ / "gs_map_final.ply";
+    gs_map_io::dump_gs_map_to_ply(path, snapshot);
+    RCLCPP_INFO(this->get_logger(), "GS map final save: %zu Gaussians -> %s",
+                snapshot.size(), path.c_str());
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(this->get_logger(), "GS map final save failed: %s", e.what());
+  }
+}
+
+void LIVMapper::prune_old_gs_saves_(int current_frame_idx)
+{
+  // Keeps the disk footprint bounded by deleting oldest periodic saves
+  // beyond max_retained_saves_. The shutdown save (gs_map_final.ply) is
+  // never matched by the glob because of the "_final" suffix, so it
+  // survives every pruning pass. Implementation: std::filesystem
+  // directory iteration + name parsing -- cheap (one open + readdir per
+  // save), runs on the worker thread so it doesn't touch the hot loop.
+  if (max_retained_saves_ <= 0) return;  // 0 / negative => keep everything
+  std::error_code ec;
+  if (!std::filesystem::exists(gs_save_dir_, ec)) return;
+
+  struct SavedEntry { std::filesystem::path path; int frame; };
+  std::vector<SavedEntry> saves;
+  for (const auto& entry : std::filesystem::directory_iterator(gs_save_dir_, ec))
+  {
+    if (!entry.is_regular_file()) continue;
+    const std::string name = entry.path().filename().string();
+    constexpr const char* kPrefix = "gs_map_";
+    constexpr const char* kSuffix = ".ply";
+    if (name.rfind(kPrefix, 0) != 0) continue;
+    if (name.size() <= std::string(kPrefix).size() + std::string(kSuffix).size()) continue;
+    if (name.compare(name.size() - std::string(kSuffix).size(),
+                     std::string(kSuffix).size(), kSuffix) != 0) continue;
+    // Skip gs_map_final.ply (the shutdown save) -- it must survive.
+    const std::string stem = name.substr(std::string(kPrefix).size(),
+                                         name.size() - std::string(kPrefix).size()
+                                                     - std::string(kSuffix).size());
+    if (stem == "final") continue;
+    try {
+      saves.push_back({entry.path(), std::stoi(stem)});
+    } catch (const std::exception&) {
+      // Unparseable filename -- leave it alone, don't risk deleting
+      // something we don't recognize.
+    }
+  }
+  if (static_cast<int>(saves.size()) <= max_retained_saves_) return;
+  std::sort(saves.begin(), saves.end(),
+            [](const SavedEntry& a, const SavedEntry& b) { return a.frame < b.frame; });
+  const size_t to_delete = saves.size() - static_cast<size_t>(max_retained_saves_);
+  for (size_t i = 0; i < to_delete; ++i) {
+    std::filesystem::remove(saves[i].path, ec);
+  }
 }
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
@@ -787,7 +976,7 @@ void LIVMapper::pointBodyToWorld(const PointType &pi, PointType &po)
   po.intensity = pi.intensity;
 }
 
-template <typename T> void LIVMapper::pointBodyToWorld(const Matrix<T, 3, 1> &pi, Matrix<T, 3, 1> &po)
+template <typename T> void LIVMapper::pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi, Eigen::Matrix<T, 3, 1> &po)
 {
   V3D p_body(pi[0], pi[1], pi[2]);
   V3D p_global(_state.rot_end * (extR * p_body + extT) + _state.pos_end);
@@ -796,11 +985,11 @@ template <typename T> void LIVMapper::pointBodyToWorld(const Matrix<T, 3, 1> &pi
   po[2] = p_global(2);
 }
 
-template <typename T> Matrix<T, 3, 1> LIVMapper::pointBodyToWorld(const Matrix<T, 3, 1> &pi)
+template <typename T> Eigen::Matrix<T, 3, 1> LIVMapper::pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi)
 {
   V3D p(pi[0], pi[1], pi[2]);
   p = (_state.rot_end * (extR * p + extT) + _state.pos_end);
-  Matrix<T, 3, 1> po(p[0], p[1], p[2]);
+  Eigen::Matrix<T, 3, 1> po(p[0], p[1], p[2]);
   return po;
 }
 

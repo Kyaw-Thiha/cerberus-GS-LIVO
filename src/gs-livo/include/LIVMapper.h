@@ -16,8 +16,8 @@ which is included as part of this source code package.
 #include "IMU_Processing.h"
 #include "vio.h"
 #include "preprocess.h"
-#include <cv_bridge/cv_bridge.h>
-#include <image_transport/image_transport.h>
+#include <cv_bridge/cv_bridge.hpp>
+#include <image_transport/image_transport.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -34,10 +34,16 @@ which is included as part of this source code package.
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
-// TODO(ros2-migration): rpg_vikit is not vendored in this repo (pre-existing gap); its ROS1
-// vk::camera_loader::loadFromRosNs used ROS1 param-server namespace lookup and has no ROS2 port
-// vendored here yet. #include <vikit/camera_loader.h> intentionally omitted; see the call site in
-// LIVMapper.cpp::initializeComponents() for the TODO-commented replacement.
+#include <atomic>
+#include <filesystem>
+#include <future>
+#include <string>
+// vikit headers from the vendored rpg_vikit/ sub-tree (Robotic-Developer-Road
+// fork, patched to ament_cmake -- see src/rpg_vikit/vikit_common/CMakeLists.txt).
+// These were omitted at the ROS1->ROS2 migration (commit af3d2f5) because the
+// rpg_vikit dir was empty; vendoring it (this commit) restores both the include
+// AND the loadFromRosNs call in LIVMapper.cpp::initializeCamera().
+#include <vikit/camera_loader.h>
 
 class LIVMapper : public rclcpp::Node
 {
@@ -46,6 +52,14 @@ public:
   ~LIVMapper();
   void initializeSubscribersAndPublishers(image_transport::ImageTransport &it);
   void initializeComponents();
+  // Separate from initializeComponents() because loadFromRosNs uses
+  // shared_from_this() to acquire a Node::SharedPtr, and that throws
+  // std::bad_weak_ptr when called from a constructor body (the shared_ptr
+  // constructed via std::make_shared<LIVMapper>(...) hasn't finished
+  // construction yet, so enable_shared_from_this::weak_this is still empty).
+  // Pattern: build the LIVMapper via std::make_shared, then call this BEFORE
+  // initializeSubscribersAndPublishers. See main.cpp for the call order.
+  void initializeCamera();
   void initializeFiles();
   void run();
   void gravityAlignment();
@@ -54,6 +68,21 @@ public:
   void handleVIO();
   void handleLIO();
   void savePCD();
+  // Async-saves the in-memory 3D Gaussian Splat map (VIOManager's
+  // sub_GSMap + gsmap_manager->gs_map_ octree) to a binary PLY file
+  // under Log/GSMap/. The save runs on a detached std::future so the
+  // SLAM hot loop is not blocked on disk I/O (the brief mutex hold
+  // during snapshot is the only sync point -- microseconds for typical
+  // map sizes). Called from run() at shutdown and (when enabled) on
+  // a periodic timer. No-op when gs_save_en is false -- see
+  // initializeFiles() for the gating.
+  void saveGSMap();
+  // Walks gs_save_dir_ and removes the oldest periodic saves beyond
+  // publish.max_retained_saves_, keeping the on-disk footprint bounded.
+  // gs_map_final.ply is treated as untouchable. Runs on the worker thread
+  // -- cheap enough (one open + readdir per prune) to not warrant its
+  // own thread but too late-binding to do in the snapshot helper.
+  void prune_old_gs_saves_(int current_frame_idx);
   void processImu();
 
   bool sync_packages(LidarMeasureGroup &meas);
@@ -227,5 +256,19 @@ public:
   double aver_time_icp = 0;
   double aver_time_map_inre = 0;
   bool colmap_output_en = false;
+
+  // 3D Gaussian Splat map persistence (gated async export to PLY files in
+  // Log/GSMap/). All flags default to safe values -- nothing is written
+  // unless gs_save_en is explicitly set to true. See saveGSMap() and the
+  // initializeFiles() parameter declarations for the wiring.
+  std::filesystem::path gs_save_dir_;          // computed from root_dir + "/Log/GSMap"
+  bool gs_save_en = false;                     // publish.gs_save_en -- master enable
+  bool save_on_shutdown_ = true;               // publish.save_on_shutdown
+  int save_interval_frames_ = 500;             // publish.save_interval_frames
+  int max_retained_saves_ = 5;                 // publish.max_retained_saves (periodic only; final is never pruned)
+  int gs_frame_counter_ = 0;                   // bumped per processed frame
+  int last_saved_frame_ = 0;                   // last frame index that triggered a periodic save
+  std::atomic<bool> gs_save_in_progress_{false}; // true while a detached save future is alive
+  std::future<void> gs_save_future_;          // handle to the in-flight save (joined in destructor)
 };
 #endif
