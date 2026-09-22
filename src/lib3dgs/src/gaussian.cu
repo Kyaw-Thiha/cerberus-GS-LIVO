@@ -3,6 +3,7 @@
 #include "read_utils.cuh"
 #include <exception>
 #include <thread>
+#include <cstdint>
 
 GaussianModel::GaussianModel(void){
     _max_sh_degree=0;
@@ -807,9 +808,9 @@ void GaussianModel::Reset_opacity() {
     auto new_opacity = inverse_sigmoid(torch::ones_like(_opacity, torch::TensorOptions().dtype(torch::kFloat32)) * 0.01f);
 
     auto adamParamStates = std::make_unique<torch::optim::AdamParamState>(static_cast<torch::optim::AdamParamState&>(
-        *_optimizer->state()[c10::guts::to_string(_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl())]));
+        *_optimizer->state()[_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl()]));
 
-    _optimizer->state().erase(c10::guts::to_string(_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl()));
+    _optimizer->state().erase(_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl());
 
     adamParamStates->exp_avg(torch::zeros_like(new_opacity));
     adamParamStates->exp_avg_sq(torch::zeros_like(new_opacity));
@@ -817,20 +818,20 @@ void GaussianModel::Reset_opacity() {
     _optimizer->param_groups()[5].params()[0] = new_opacity.set_requires_grad(true);
     _opacity = _optimizer->param_groups()[5].params()[0];
 
-    _optimizer->state()[c10::guts::to_string(_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl())] = std::move(adamParamStates);
+    _optimizer->state()[_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl()] = std::move(adamParamStates);
 }
 
 void prune_optimizer(torch::optim::Adam* optimizer, const torch::Tensor& mask, torch::Tensor& old_tensor, int param_position) {
     auto adamParamStates = std::make_unique<torch::optim::AdamParamState>(static_cast<torch::optim::AdamParamState&>(
-        *optimizer->state()[c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl())]));
-    optimizer->state().erase(c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()));
+        *optimizer->state()[optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()]));
+    optimizer->state().erase(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl());
 
     adamParamStates->exp_avg(adamParamStates->exp_avg().index_select(0, mask));
     adamParamStates->exp_avg_sq(adamParamStates->exp_avg_sq().index_select(0, mask));
 
     optimizer->param_groups()[param_position].params()[0] = old_tensor.index_select(0, mask).set_requires_grad(true);
     old_tensor = optimizer->param_groups()[param_position].params()[0]; // update old tensor
-    optimizer->state()[c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl())] = std::move(adamParamStates);
+    optimizer->state()[optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()] = std::move(adamParamStates);
 }
 
 void GaussianModel::prune_points(torch::Tensor mask) {
@@ -855,8 +856,8 @@ void cat_tensors_to_optimizer(torch::optim::Adam* optimizer,
                               torch::Tensor& old_tensor,
                               int param_position) {
     auto adamParamStates = std::make_unique<torch::optim::AdamParamState>(static_cast<torch::optim::AdamParamState&>(
-        *optimizer->state()[c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl())]));
-    optimizer->state().erase(c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()));
+        *optimizer->state()[optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()]));
+    optimizer->state().erase(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl());
 
     adamParamStates->exp_avg(torch::cat({adamParamStates->exp_avg(), torch::zeros_like(extension_tensor)}, 0));
     adamParamStates->exp_avg_sq(torch::cat({adamParamStates->exp_avg_sq(), torch::zeros_like(extension_tensor)}, 0));
@@ -864,7 +865,7 @@ void cat_tensors_to_optimizer(torch::optim::Adam* optimizer,
     optimizer->param_groups()[param_position].params()[0] = torch::cat({old_tensor, extension_tensor}, 0).set_requires_grad(true);
     old_tensor = optimizer->param_groups()[param_position].params()[0];
 
-    optimizer->state()[c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl())] = std::move(adamParamStates);
+    optimizer->state()[optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()] = std::move(adamParamStates);
 }
 
 void GaussianModel::densification_postfix(torch::Tensor& new_xyz,
@@ -917,7 +918,7 @@ void GaussianModel::densify_and_split(torch::Tensor& grads, float grad_threshold
 
 void GaussianModel::densify_and_clone(torch::Tensor& grads, float grad_threshold, float scene_extent) {
     // Extract points that satisfy the gradient condition
-    torch::Tensor selected_pts_mask = torch::where(torch::linalg::vector_norm(grads, {2}, 1, true, torch::kFloat32) >= grad_threshold,
+    torch::Tensor selected_pts_mask = torch::where(torch::linalg_vector_norm(grads, {2}, 1, true, torch::kFloat32) >= grad_threshold,
                                                    torch::ones_like(grads.index({torch::indexing::Slice()})).to(torch::kBool),
                                                    torch::zeros_like(grads.index({torch::indexing::Slice()})).to(torch::kBool))
                                           .to(torch::kLong);

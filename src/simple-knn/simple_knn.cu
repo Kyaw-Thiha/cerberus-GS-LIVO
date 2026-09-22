@@ -18,6 +18,13 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <vector>
 #include <cuda_runtime_api.h>
+// FLT_MAX -- this file was originally only ever built as a torch Python
+// extension (see setup.py's CUDAExtension), which transitively pulled in
+// <cfloat> via torch's own headers. Compiled standalone here (folded
+// directly into lib3dgs, see lib3dgs/CMakeLists.txt's SOURCES comment) it
+// doesn't get that for free -- confirmed by hitting "identifier FLT_MAX is
+// undefined" without it.
+#include <cfloat>
 #include <thrust/device_vector.h>
 #include <thrust/sequence.h>
 #define __CUDACC__

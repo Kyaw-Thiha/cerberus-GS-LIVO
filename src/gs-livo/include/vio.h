@@ -20,7 +20,9 @@ which is included as part of this source code package.
 #include "feature.h"
 #include <opencv2/imgproc/imgproc_c.h>
 #include <pcl/filters/voxel_grid.h>
+#include <mutex>
 #include <set>
+#include <vector>
 #include <vikit/math_utils.h>
 #include <vikit/robust_cost.h>
 #include <vikit/vision.h>
@@ -162,6 +164,13 @@ public:
   int64 gs_total=0;
   std::ofstream performance_file;
 
+  // Guards sub_GSMap, gs_octree (= gsmap_manager->gs_map_), and
+  // sub_octree_ptr_list against the async snapshot path in
+  // snapshot_gs_map_under_lock(). Held briefly (one memcpy + a flat
+  // walk of the octree leaves) -- the save I/O itself happens
+  // OUTSIDE the lock on the future's worker thread.
+  std::mutex gs_map_mutex_;
+
   vector<int> grid_num;
   vector<int> map_index;
   vector<int> border_flag;
@@ -191,7 +200,7 @@ public:
   int frame_count = 0;
   bool plot_flag;
 
-  Matrix<double, DIM_STATE, DIM_STATE> G, H_T_H;
+  Eigen::Matrix<double, DIM_STATE, DIM_STATE> G, H_T_H;
   MatrixXd K, H_sub_inv;
 
   ofstream fout_camera, fout_colmap;
@@ -226,6 +235,14 @@ public:
   void setImuToLidarExtrinsic(const V3D &transl, const M3D &rot);
   void setLidarToCameraExtrinsic(vector<double> &R, vector<double> &P);
   void initializeVIO();
+
+  // Returns a copy of (sub_GSMap ++ flat-walked gsmap_manager->gs_map_ octree)
+  // under a brief mutex hold. Caller owns the returned vector and is
+  // expected to pass it to gs_map_io::dump_gs_map_to_ply on a thread
+  // that does NOT hold any reference to the live data structures
+  // (the snapshot is a deep copy). Used by LIVMapper::saveGSMap() to
+  // implement async persistence with zero SLAM-accuracy impact.
+  std::vector<GS_point> snapshot_gs_map_under_lock();
   void getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level);
   void computeProjectionJacobian(V3D p, MD(2, 3) & J);
   void computeJacobianAndUpdateEKF(cv::Mat img);
@@ -233,11 +250,11 @@ public:
   void resetGrid();
 
   void updateVisualMapPoints(cv::Mat img);
-  void getWarpMatrixAffine(const vk::AbstractCamera &cam, const Vector2d &px_ref, const Vector3d &f_ref, const double depth_ref, const SE3 &T_cur_ref,
+  void getWarpMatrixAffine(const vk::AbstractCamera &cam, const Vector2d &px_ref, const Vector3d &f_ref, const double depth_ref, const SE3d &T_cur_ref,
                            const int level_ref, 
                            const int pyramid_level, const int halfpatch_size, Matrix2d &A_cur_ref);
   void getWarpMatrixAffineHomography(const vk::AbstractCamera &cam, const V2D &px_ref,
-                                     const V3D &xyz_ref, const V3D &normal_ref, const SE3 &T_cur_ref, const int level_ref, Matrix2d &A_cur_ref);
+                                     const V3D &xyz_ref, const V3D &normal_ref, const SE3d &T_cur_ref, const int level_ref, Matrix2d &A_cur_ref);
   void warpAffine(const Matrix2d &A_cur_ref, const cv::Mat &img_ref, const Vector2d &px_ref, const int level_ref, const int search_level,
                   const int pyramid_level, const int halfpatch_size, float *patch);
   void insertPointIntoVoxelMap(VisualPoint *pt_new);

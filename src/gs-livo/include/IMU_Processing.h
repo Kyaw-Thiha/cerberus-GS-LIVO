@@ -19,7 +19,15 @@ which is included as part of this source code package.
 #include <nav_msgs/msg/odometry.hpp>
 #include <utils/so3_math.h>
 #include <fstream>
-const bool time_list(PointType &x, PointType &y) { return (x.curvature < y.curvature); }
+// inline: this header is included by multiple .cpp files (main.cpp,
+// vio.cpp, LIVMapper.cpp, IMU_Processing.cpp) -- without it, each
+// translation unit emits its own strong-symbol definition, and modern
+// GCC's -fno-common default (GCC >=10) rejects the resulting "multiple
+// definition of time_list" at link time. Same class of bug and same fix
+// already applied in the sibling cerberus-FAST-LIVO2 fork (commit
+// 837b7bb, "Fix: resolve multiple definition of time_list"), never
+// ported over to this fork until now.
+inline const bool time_list(PointType &x, PointType &y) { return (x.curvature < y.curvature); }
 
 /// *************IMU Process and undistortion
 class ImuProcess

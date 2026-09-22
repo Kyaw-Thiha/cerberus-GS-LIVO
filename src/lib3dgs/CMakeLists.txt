@@ -11,9 +11,12 @@ get_filename_component(PROJ_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}" ABSOLUTE)
 # Define the absolute path to libtorch
 
 
-set(SIMPLE_KNN_DIR "/usr/local") 
-include_directories(${SIMPLE_KNN_DIR}/include/simple-knn/)
-link_directories(${SIMPLE_KNN_DIR}/lib)
+# Previously "/usr/local", expecting simple-knn to have been built+
+# installed system-wide separately -- nothing ever did that (same gap as
+# the identical fix already applied in ../gs-livo/CMakeLists.txt). Point
+# directly at the vendored source instead.
+set(SIMPLE_KNN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../simple-knn")
+include_directories(${SIMPLE_KNN_DIR})
 
 # Set CMAKE_PREFIX_PATH
 
@@ -34,6 +37,7 @@ message(STATUS "Building with ${used_cores} out of ${total_cores} available core
 set(HEADERS
         includes/read_utils.cuh
         includes/gaussian.cuh
+        includes/gs_map_writer.h
         includes/camera.cuh
         includes/loss_monitor.cuh
         includes/image.cuh
@@ -60,9 +64,20 @@ set(HEADERS
         cuda_rasterizer/serialization.h
 )
 
+# simple-knn has no CMake build of its own -- only a setup.py wiring it up
+# as a torch.utils.cpp_extension.CUDAExtension Python module
+# (simple_knn._C), which this plain-CMake/nvcc build doesn't use. There is
+# no `simple-knn` CMake target anywhere for the target_link_libraries(
+# 3dgs_lib ... simple-knn ...) call below to resolve -- confirmed: nothing
+# in this repo ever produces libsimple-knn.{so,a}. spatial.cu/simple_knn.cu
+# are the only two real source files it needs (ext.cpp is pybind11 glue for
+# the Python module, not needed here); compile them straight into 3dgs_lib
+# instead of as a separate library, and drop the unresolvable `simple-knn`
+# link target below.
 set(SOURCES
         # src/main.cu
         src/read_utils.cu
+        src/gs_map_writer.cpp
         src/gaussian.cu
         src/camera.cu
         src/loss_monitor.cu
@@ -76,6 +91,8 @@ set(SOURCES
         cuda_rasterizer/backward.cu
         cuda_rasterizer/forward.cu
         cuda_rasterizer/rasterizer_impl.cu
+        ${SIMPLE_KNN_DIR}/spatial.cu
+        ${SIMPLE_KNN_DIR}/simple_knn.cu
 )
 
 
@@ -122,13 +139,12 @@ find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
 
-set(LIBTORCH_DIR "./libtorch")
-include_directories(${LIBTORCH_DIR}/include)
-link_directories(${LIBTORCH_DIR}/lib)
-
-# set(CMAKE_PREFIX_PATH "${LIBTORCH_DIR};${CMAKE_PREFIX_PATH}")
-# find_package(Torch REQUIRED)
-find_package(Torch REQUIRED PATHS ${LIBTORCH_DIR} NO_DEFAULT_PATH)
+# Previously "./libtorch" (a manually downloaded-and-extracted LibTorch
+# zip layout) with NO_DEFAULT_PATH forcing find_package(Torch) to ONLY look
+# there -- same gap as ../gs-livo/CMakeLists.txt's identical pattern, fixed
+# the same way: point at the pixi/conda-forge `libtorch` package's real
+# installed location instead.
+find_package(Torch REQUIRED PATHS "$ENV{CONDA_PREFIX}/share/cmake/Torch" NO_DEFAULT_PATH)
 
 
 find_package(CUDA REQUIRED)
@@ -151,7 +167,6 @@ target_link_libraries(3dgs_lib
         CUDA::curand
         CUDA::cublas
         ${OpenCV_LIBS}
-        simple-knn
         tinyply
         Eigen3::Eigen
         nlohmann_json::nlohmann_json

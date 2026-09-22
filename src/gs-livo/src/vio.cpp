@@ -194,6 +194,66 @@ void VIOManager::initializeVIO()
   sub_feat_map.clear();
 }
 
+std::vector<GS_point> VIOManager::snapshot_gs_map_under_lock()
+{
+  // Brief critical section: one lock + two copies + one octree walk.
+  // The hot loop's GS-mutating call sites (gsmap_manager->UpdateGSMap at
+  // vio.cpp:480/:507/:700, sub_GSMap.push_back at :581, sub_GSMap.clear
+  // at :518, sub_GSMap.pop_back at :703) all need to be inside this same
+  // lock for the snapshot to be consistent -- otherwise the snapshot
+  // could observe e.g. a half-cleared sub_GSMap or a gs_octree entry
+  // whose points have been erased from sub_GSMap but not yet pushed.
+  // The lock is released as soon as the snapshot returns; I/O happens
+  // on the caller's detached std::future.
+  std::lock_guard<std::mutex> lock(gs_map_mutex_);
+
+  // Size estimate first so the std::vector doesn't reallocate while we
+  // copy out the octree leaves. The active working set is bounded by
+  // outlier_threshold3 (~100 default), and the persistent octree can
+  // hold up to GSMAP_MAX_POINTS_PER_LEAF * #leaves -- the latter is
+  // unbounded but in practice tens of thousands.
+  const size_t active_size = sub_GSMap.size();
+  size_t octree_size = 0;
+  if (gsmap_manager)
+  {
+    for (const auto& kv : gsmap_manager->gs_map_)
+    {
+      // GSVoxelOctree::gs_points_ is a std::vector<GS_point*>. Each
+      // entry's pointed-to GS_point is owned by the octree (allocated
+      // with new in vio.cpp:470/:507/:700, freed in ~GSVoxelOctree at
+      // GSVoxelOctree.h:79-86) -- safe to read without taking additional
+      // ownership; we deep-copy the *value* into our snapshot below.
+      octree_size += kv.second ? kv.second->gs_points_.size() : 0;
+    }
+  }
+
+  std::vector<GS_point> snapshot;
+  snapshot.reserve(active_size + octree_size);
+
+  // Active working set: in-order so callers see photometrically-fresh
+  // points first (sub_GSMap carries the latest Dump_to_our_format
+  // round-trip from vio.cpp:2523).
+  snapshot.insert(snapshot.end(), sub_GSMap.begin(), sub_GSMap.end());
+
+  // Persistent octree: flat walk over each leaf's gs_points_, copying
+  // the pointed-to GS_point by value. After this copy returns, the
+  // hot loop is free to mutate gsmap_manager->gs_map_ again -- the
+  // snapshot owns its own GS_point memory.
+  if (gsmap_manager)
+  {
+    for (const auto& kv : gsmap_manager->gs_map_)
+    {
+      if (!kv.second) continue;
+      for (const GS_point* p : kv.second->gs_points_)
+      {
+        if (p) snapshot.push_back(*p);
+      }
+    }
+  }
+
+  return snapshot;
+}
+
 void VIOManager::resetGrid()
 {
   fill(grid_num.begin(), grid_num.end(), TYPE_UNKNOWN);
@@ -285,12 +345,12 @@ void VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
 }
 
 void VIOManager::getWarpMatrixAffineHomography(const vk::AbstractCamera &cam, const V2D &px_ref, const V3D &xyz_ref, const V3D &normal_ref,
-                                                  const SE3 &T_cur_ref, const int level_ref, Matrix2d &A_cur_ref)
+                                                  const SE3d &T_cur_ref, const int level_ref, Matrix2d &A_cur_ref)
 {
   // create homography matrix
   const V3D t = T_cur_ref.inverse().translation();
   const Eigen::Matrix3d H_cur_ref =
-      T_cur_ref.rotation_matrix() * (normal_ref.dot(xyz_ref) * Eigen::Matrix3d::Identity() - t * normal_ref.transpose());
+      T_cur_ref.rotationMatrix() * (normal_ref.dot(xyz_ref) * Eigen::Matrix3d::Identity() - t * normal_ref.transpose());
   // Compute affine warp matrix A_ref_cur using homography projection
   const int kHalfPatchSize = 4;
   V3D f_du_ref(cam.cam2world(px_ref + Eigen::Vector2d(kHalfPatchSize, 0) * (1 << level_ref)));
@@ -308,7 +368,7 @@ void VIOManager::getWarpMatrixAffineHomography(const vk::AbstractCamera &cam, co
 }
 
 void VIOManager::getWarpMatrixAffine(const vk::AbstractCamera &cam, const Vector2d &px_ref, const Vector3d &f_ref, const double depth_ref,
-                                        const SE3 &T_cur_ref, const int level_ref, const int pyramid_level, const int halfpatch_size,
+                                        const SE3d &T_cur_ref, const int level_ref, const int pyramid_level, const int halfpatch_size,
                                         Matrix2d &A_cur_ref)
 {
   // Compute affine warp matrix A_ref_cur
@@ -419,7 +479,12 @@ Quaternions computeQuaternionFromNormals(const Eigen::Vector3f& normal, const Ei
 
 void VIOManager::insertPointInto_GS_Map2(const std::vector<pointWithVar>& pg)
 {
-  for (const auto& pointVar : pg) 
+  // gs_map_mutex_ guards sub_GSMap + gsmap_manager->gs_map_ for the async
+  // snapshot path (snapshot_gs_map_under_lock). Held for the entire body
+  // of this function so concurrent iteration of the unordered_map is
+  // impossible while any erase/insert/UpdateGSMap is in flight.
+  std::lock_guard<std::mutex> _gs_map_lock(gs_map_mutex_);
+  for (const auto& pointVar : pg)
   {
     V3D p_w(pointVar.point_w.x(), pointVar.point_w.y(), pointVar.point_w.z());
     V3D p_b(pointVar.point_b.x(), pointVar.point_b.y(), pointVar.point_b.z());
@@ -486,7 +551,13 @@ void VIOManager::insertPointInto_GS_Map2(const std::vector<pointWithVar>& pg)
 
 void VIOManager::retrieveFrom_GS_Map2(vector<pointWithVar> &pg)
 {
-  
+  // gs_map_mutex_ guards sub_GSMap + gsmap_manager->gs_map_ for the async
+  // snapshot path. The entire function body mutates one or both of these,
+  // so hold the lock for the whole thing rather than wrapping each of the
+  // ~10 individual mutations (which would invite a future maintainer to
+  // forget one and reintroduce a data race against snapshot_gs_map_under_lock).
+  std::lock_guard<std::mutex> _gs_map_lock(gs_map_mutex_);
+
    size_t keep_size ;
    size_t delete_size ;
 
@@ -828,7 +899,7 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
         if (pt == nullptr) continue;
         if (pt->obs_.size() == 0) continue;
 
-        V3D norm_vec(new_frame_->T_f_w_.rotation_matrix() * pt->normal_);
+        V3D norm_vec(new_frame_->T_f_w_.rotationMatrix() * pt->normal_);
         V3D dir(new_frame_->T_f_w_ * pt->pos_);
         if (dir[2] < 0) continue;
         // dir.normalize();
@@ -906,7 +977,7 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
             // sub_map_ray.push_back(pt); // cloud_visual_sub_map
             // add_sample = true;
 
-            V3D norm_vec(new_frame_->T_f_w_.rotation_matrix() * pt->normal_);
+            V3D norm_vec(new_frame_->T_f_w_.rotationMatrix() * pt->normal_);
             V3D dir(new_frame_->T_f_w_ * pt->pos_);
             if (dir[2] < 0) continue;
             dir.normalize();
@@ -1069,7 +1140,7 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
 
       if (normal_en)
       {
-        V3D norm_vec = (ref_ftr->T_f_w_.rotation_matrix() * pt->normal_).normalized();
+        V3D norm_vec = (ref_ftr->T_f_w_.rotationMatrix() * pt->normal_).normalized();
         
         V3D pf(ref_ftr->T_f_w_ * pt->pos_);
         // V3D pf_norm = pf.normalized();
@@ -1078,7 +1149,7 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
         // if(cos_theta < 0) norm_vec = -norm_vec;
         // if (abs(cos_theta) < 0.08) continue; // 0.5 60 degree 0.34 70 degree 0.17 80 degree 0.08 85 degree
 
-        SE3 T_cur_ref = new_frame_->T_f_w_ * ref_ftr->T_f_w_.inverse();
+        SE3d T_cur_ref = new_frame_->T_f_w_ * ref_ftr->T_f_w_.inverse();
 
         getWarpMatrixAffineHomography(*cam, ref_ftr->px_, pf, norm_vec, T_cur_ref, 0, A_cur_ref_zero);
 
@@ -1247,7 +1318,7 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
       pointWithVar pt_var = append_voxel_points[i];
       V3D pt = pt_var.point_w;
 
-      V3D norm_vec(new_frame_->T_f_w_.rotation_matrix() * pt_var.normal);
+      V3D norm_vec(new_frame_->T_f_w_.rotationMatrix() * pt_var.normal);
       V3D dir(new_frame_->T_f_w_ * pt);
       dir.normalize();
       double cos_theta = dir.dot(norm_vec);
@@ -1293,7 +1364,7 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
   if (total_points == 0) return;
 
   int update_num = 0;
-  SE3 pose_cur = new_frame_->T_f_w_;
+  SE3d pose_cur = new_frame_->T_f_w_;
   for (int i = 0; i < total_points; i++)
   {
     VisualPoint *pt = visual_submap->voxel_points[i];
@@ -1315,10 +1386,10 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
     // if(new_frame_->id_ >= last_feature->id_ + 10) add_flag = true; // 10
 
     // Step 2: delta_pose
-    SE3 pose_ref = last_feature->T_f_w_;
-    SE3 delta_pose = pose_ref * pose_cur.inverse();
+    SE3d pose_ref = last_feature->T_f_w_;
+    SE3d delta_pose = pose_ref * pose_cur.inverse();
     double delta_p = delta_pose.translation().norm();
-    double delta_theta = (delta_pose.rotation_matrix().trace() > 3.0 - 1e-6) ? 0.0 : std::acos(0.5 * (delta_pose.rotation_matrix().trace() - 1));
+    double delta_theta = (delta_pose.rotationMatrix().trace() > 3.0 - 1e-6) ? 0.0 : std::acos(0.5 * (delta_pose.rotationMatrix().trace() - 1));
     if (delta_p > 0.5 || delta_theta > 0.3) add_flag = true; // 0.5 || 0.3
 
     // Step 3: pixel distance
@@ -1393,10 +1464,10 @@ void VIOManager::updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelO
 
           if (dis_to_plane_abs < 3 * sqrt(sigma_l))
           {
-            // V3D norm_vec(new_frame_->T_f_w_.rotation_matrix() * plane.normal_);
+            // V3D norm_vec(new_frame_->T_f_w_.rotationMatrix() * plane.normal_);
             // V3D pf(new_frame_->T_f_w_ * pt->pos_);
             // V3D pf_ref(pt->ref_patch->T_f_w_ * pt->pos_);
-            // V3D norm_vec_ref(pt->ref_patch->T_f_w_.rotation_matrix() *
+            // V3D norm_vec_ref(pt->ref_patch->T_f_w_.rotationMatrix() *
             // plane.normal); double cos_ref = pf_ref.dot(norm_vec_ref);
             
             if (pt->previous_normal_.dot(plane.normal_) < 0) { pt->normal_ = -plane.normal_; }
@@ -1429,7 +1500,7 @@ void VIOManager::updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelO
       int count = 0;
 
       V3D pf = ref_patch_temp->T_f_w_ * pt->pos_;
-      V3D norm_vec = ref_patch_temp->T_f_w_.rotation_matrix() * pt->normal_;
+      V3D norm_vec = ref_patch_temp->T_f_w_.rotationMatrix() * pt->normal_;
       pf.normalize();
       double cos_angle = pf.dot(norm_vec);
       // if(fabs(cos_angle) < 0.86) continue; // 20 degree
@@ -1519,7 +1590,7 @@ void VIOManager::projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, Vo
       V2D pc(new_frame_->w2c(pt->pos_));
       V2D pc_prior(new_frame_->w2c_prior(pt->pos_));
 
-      V3D norm_vec(ref_ftr->T_f_w_.rotation_matrix() * pt->normal_);
+      V3D norm_vec(ref_ftr->T_f_w_.rotationMatrix() * pt->normal_);
       V3D pf(ref_ftr->T_f_w_ * pt->pos_);
 
       if (pf.dot(norm_vec) < 0) norm_vec = -norm_vec;
@@ -1528,7 +1599,7 @@ void VIOManager::projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, Vo
       cv::Mat img_cur = new_frame_->img_;
       cv::Mat img_ref = ref_ftr->img_;
 
-      SE3 T_cur_ref = new_frame_->T_f_w_ * ref_ftr->T_f_w_.inverse();
+      SE3d T_cur_ref = new_frame_->T_f_w_ * ref_ftr->T_f_w_.inverse();
       Matrix2d A_cur_ref;
       getWarpMatrixAffineHomography(*cam, ref_ftr->px_, pf, norm_vec, T_cur_ref, 0, A_cur_ref);
 
@@ -1733,7 +1804,7 @@ void VIOManager::precomputeReferencePatches(int level)
     double depth((pt->pos_ - pt->ref_patch->pos()).norm());
     V3D pf = pt->ref_patch->f_ * depth;
     V2D pc = pt->ref_patch->px_;
-    M3D R_ref_w = pt->ref_patch->T_f_w_.rotation_matrix();
+    M3D R_ref_w = pt->ref_patch->T_f_w_.rotationMatrix();
 
     computeProjectionJacobian(pf, Jdpi);
     p_w_hat << SKEW_SYM_MATRX(pt->pos_);
@@ -2224,7 +2295,7 @@ void VIOManager::updateFrameState(StatesGroup state)
   V3D Pwi(state.pos_end);
   Rcw = Rci * Rwi.transpose();
   Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
-  new_frame_->T_f_w_ = SE3(Rcw, Pcw);
+  new_frame_->T_f_w_ = SE3d(Rcw, Pcw);
 }
 
 void VIOManager::plotTrackedPoints()
@@ -2338,7 +2409,7 @@ void VIOManager::dumpDataForColmap()
   pinhole_cam->undistortImage(img_rgb, img_rgb_undistort);
   cv::imwrite(image_path, img_rgb_undistort);
   
-  Eigen::Quaterniond q(new_frame_->T_f_w_.rotation_matrix());
+  Eigen::Quaterniond q(new_frame_->T_f_w_.rotationMatrix());
   Eigen::Vector3d t = new_frame_->T_f_w_.translation();
   fout_colmap << cnt << " "
             << std::fixed << std::setprecision(6)  // 保证浮点数精度为6位
@@ -2520,7 +2591,16 @@ void VIOManager::processFrameGS(cv::Mat &img, vector<pointWithVar> &pg, const un
     // geometric measurement, and it lets retrieveFrom_GS_Map2() persist the
     // refined values into the octree when a point is evicted from active
     // tracking or dropped by the outlier-capacity downsample.
-    gaussians.Dump_to_our_format(sub_GSMap, static_cast<int>(sub_GSMap.size()));
+    //
+    // gs_map_mutex_ guards the write into sub_GSMap so the async snapshot
+    // path (snapshot_gs_map_under_lock) can't observe a half-written
+    // Gaussian during the memcpy. Held only for the duration of this
+    // single call -- the rest of processFrameGS (photometric rendering,
+    // EKF update) does not touch sub_GSMap or gs_map_ and is left unlocked.
+    {
+      std::lock_guard<std::mutex> _gs_map_lock(gs_map_mutex_);
+      gaussians.Dump_to_our_format(sub_GSMap, static_cast<int>(sub_GSMap.size()));
+    }
   }
 
 
